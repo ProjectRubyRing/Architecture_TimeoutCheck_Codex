@@ -1,0 +1,15 @@
+{
+  "artifact": "AWS_Timeout_Design_Guide.xlsx",
+  "validation_date": "2026-10-08",
+  "command_attempted": "python tools\\verify_excel_native.py",
+  "result": "failed",
+  "failed_step": "win32com.client.DispatchEx(Excel.Application)",
+  "error": {
+    "type": "pywintypes.com_error",
+    "hresult": -2146959355,
+    "message": "COM server execution failed"
+  },
+  "native_render_verified": false,
+  "native_recalculation_verified": false,
+  "environment_tests_executed": false
+}

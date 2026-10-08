@@ -1,0 +1,126 @@
+"""Setting inventory: service facts and explicitly labelled design examples."""
+
+SETTINGS = []
+
+def add(group, sid, point, key, kind, limits, proposal, notes, refs=()):
+    SETTINGS.append(dict(group=group, id=sid, point=point, key=key, kind=kind,
+                         limits=limits, proposal=proposal, notes=notes, refs=list(refs)))
+
+# アプリケーションのdeadlineはAWSのリソース属性ではない。
+add('クライアント', 'C01', '画面・社内APIクライアント', 'total request deadline（アプリ実装）', '総時間／呼び出し開始から', '実装依存。ブラウザーやSDKの既定値に依存しない。', '通常30秒', '名前解決、接続、送受信、retryを含める。HTTPを中断しただけではDB処理が止まらないため、サーバ側の取消と結果確認も必要。')
+add('クライアント', 'C02', '帳票画面クライアント', 'total request deadline（アプリ実装）', '総時間／帳票要求開始から', '実装依存', '90秒', '通常画面30秒と帳票90秒をendpoint別に設定。共有ALBのidleを長くしても通常画面のdeadlineは延びない。')
+add('クライアント', 'C03', 'HTTPを発信する各クライアント', 'connect timeout / TLS handshake timeout', '接続／新しい接続を作る間', 'ライブラリ依存。DNSを含むかも確認。', '接続段階全体3秒以内', 'TCPだけ3秒、DNSは無制限、という抜け道を防ぐ。新規接続全体をdeadlineで囲む。Valkeyは別途0.2秒。')
+add('クライアント', 'C04', 'HTTPを発信する各クライアント', 'write timeout / response read timeout', '送信・読取／I/O開始または無通信から', 'ライブラリごとに「総時間」「I/O間隔」が異なる。', '通常APIのread 25秒を目安、最終的にC01で30秒', '巨大送信や少しずつ届く応答はread timeoutだけでは止まらない。write/readとも残りdeadline以下に切り詰める。')
+add('クライアント', 'C05', 'HTTP接続プール', 'pool acquire timeout / idle eviction', '借用待ち／プール要求時、idle／最後の利用から', 'ライブラリ依存', '借用1秒、未使用接続45秒で破棄', 'API用ALB60秒より早くクライアントが未使用接続を捨てる。処理中の接続は破棄しない。借用待ちも総deadlineに含める。')
+add('クライアント', 'C06', '公開API・Salesforceの業務一件', 'token + API end-to-end deadline（アプリ実装）', '総時間／トークン確認開始から', '業務契約として決める', '45秒（token10 + API30 + 余裕5）', 'トークンがcacheにあれば10秒の取得は省略。API Gatewayの統合時間にトークン取得時間は含まれない。')
+add('クライアント', 'C07', 'Salesforce Apex', 'HttpRequest.setTimeout(Integer)', 'callout待機／リクエストごと', '既定10秒、指定1～120000ms', '業務API 30000ms', 'Apex使用時の例。Named Credentialを使っても待機設定は別問題。Flow・MuleSoft・外部連携のtimeoutへそのまま転用しない。', ('S49','S50'))
+add('クライアント', 'C08', 'Salesforce Apex transaction', 'cumulative callout timeout limit', '累積／同じApex transaction内', '120秒のプラットフォーム制約', '今回の業務一件は45秒以内', 'token取得、業務API、retry、ほかのcalloutの実際の待機を合計する。非同期Apexでも無条件に120秒超へ延びるわけではない。', ('S50',))
+
+for sid, point, seconds, notes in [
+    ('A01','ALB（イントラネット画面用）',90,'画面・帳票・Lambdaからバックコンテナへの通信が共有する。最大の無通信待ちを考慮し90秒。ルールやtarget group単位のidle設定ではない。'),
+    ('A02','ALB（イントラネットAPI用）',60,'業務処理20秒より十分長いidle保護。社内APIクライアント30秒が総時間を制限する。'),
+    ('A03','ALB（帳票用）',70,'EC2の業務上限60秒より長くする。ECSからのHTTP総deadline65秒とは時計の種類が違う。'),
+    ('A04','ALB（インターネットAPI用）',60,'API Gateway統合25秒、ECS20秒より長いidle保護。ALBを延長してもGatewayの25秒は延びない。'),
+    ('A05','ALB（Salesforce API用）',60,'Private API Gateway統合25秒に合わせ、ECS20秒が先に応答を返す。')
+]:
+    add('ALB・ECS',sid,point,'idle_timeout.timeout_seconds','無通信／最後の送受信から','既定60秒、1～4000秒',f'{seconds}秒',notes,('S01',))
+add('ALB・ECS','A06','上記すべてのALB','client_keep_alive.seconds','接続寿命／client接続が成立してから','既定3600秒、60～604800秒','3600秒を維持（復旧要件で短縮）','1リクエストの業務timeoutではない。経過後に追加1リクエストを受け、Connection: close/GOAWAYで穏やかに閉じる。変更前の接続は古い値を保持。',('S01',))
+add('ALB・ECS','A07','各ALB → ECS/EC2','target connection / TLS handshake timeout','接続確立／ALBがtargetへ接続する時','接続10秒、TLS handshake10秒。独立した可変属性は提供されない。','AWS管理の10秒を前提に設計','idle_timeoutを90秒にしても接続10秒は変更されない。通常は接続済みの健全targetを使い、接続故障は別途試験する。',('S02',))
+add('ALB・ECS','A08','通常API・画面target group','deregistration_delay.timeout_seconds','切替猶予／target登録解除から','既定300秒、0～3600秒','30秒（通常API専用TGのみ）','処理20秒＋終了処理の余裕。画面TGが帳票も処理するならA09の90秒を使用。設定はTG単位、ALB idleはLB単位。',('S03',))
+add('ALB・ECS','A09','帳票を処理する画面TG・帳票EC2 TG・バックTG','deregistration_delay.timeout_seconds','切替猶予／target登録解除から','既定300秒、0～3600秒','90秒','画面帳票75秒、EC2帳票60秒、バック50秒を保護。idleとの大小関係だけでなく、SIGTERM受信時点と残処理も検証する。',('S03',))
+add('ALB・ECS','A10','全ALB target group（IP/instance）','HealthCheckTimeoutSeconds / HealthCheckIntervalSeconds','健全性確認／各check開始から','timeout既定5秒・2～120秒、interval既定30秒・5～300秒','timeout5秒、interval15秒','業務リクエストの許容処理時間ではない。軽いreadiness endpointを使い、重い帳票をcheckしない。',('S04',))
+add('ALB・ECS','A11','全ALB target group','HealthyThresholdCount / UnhealthyThresholdCount','回数／連続check結果','既定 healthy5・unhealthy2、いずれも2～10','healthy2、unhealthy2','おおよその障害検出はinterval×回数にcheck待機等を加えた時間。厳密な30秒保証にはならない。',('S04',))
+add('ALB・ECS','E01','通常画面・社内/公開/SF APIのECSアプリ','request deadline（endpointごとのアプリ設定）','総時間／サーバが要求を受けてから','ECS自体に一律のHTTP request timeout属性はない。','20秒','受信待ち・認証・DB・JSON作成・送信準備を含める。例外を整形して返すため、20秒まで計算だけを続けない。')
+add('ALB・ECS','E02','画面ECSの帳票endpoint','request deadline（アプリ設定）','総時間／帳票要求を受けてから','アプリ実装','75秒','帳票HTTP呼出し65秒＋前後処理最大5秒を含め、さらに5秒の余裕。通常endpointのE01とは別にする。')
+add('ALB・ECS','E03','バックコンテナECS','request deadline（アプリ設定）','総時間／バック要求を受けてから','アプリ実装','50秒','LambdaのHTTP呼出し55秒より先に結果を返す。業務結果を永続化してから成功応答し、同じjobIdの重複に耐える。')
+add('ALB・ECS','E04','ECSのHTTP server / reverse proxy','server keep-alive idle timeout','無通信／ALBからの最後の利用後','実装依存。NGINXならkeepalive_timeout。','120秒','最大の共有ALB idle90秒より長くする。業務deadline20/50/75秒とは別設定。ALBが先に未使用接続を閉じる余裕を取る。',('S01','S54'))
+add('ALB・ECS','E05','ECS Fargate Linux container','stopTimeout','終了猶予／正常終了要求から強制killまで','未指定30秒、最大120秒。platform条件あり。','120秒','SIGTERMを処理し新規受付を止め、残処理を最大90秒程度で収める。ECS on EC2・Windows containerは対象環境の制約を確認。',('S05',))
+add('ALB・ECS','E06','ECS container依存関係','startTimeout','起動依存待ち／依存条件を満たすまで','Fargate Linuxの最大120秒、依存関係に適用','必要な依存がある時だけ120秒','1HTTPリクエストを120秒待たせる設定ではない。containerのHEALTHY等の依存成立待ち。依存のない構成へ機械的に追加しない。',('S05',))
+add('ALB・ECS','E07','ECSサービス','healthCheckGracePeriodSeconds','起動猶予／taskが起動してから','未指定0秒','60秒を起点に起動実測で調整','ECS schedulerが異常checkを無視する時間。ALBが未健全targetへ転送するようになる設定ではない。',('S06',))
+add('ALB・ECS','E08','ECS container health check','healthCheck.timeout / interval / retries / startPeriod','健全性／check開始・起動から','timeout既定5秒、interval30秒、retries3、startPeriod0秒','5秒 / 15秒 / 3回 / 30秒','container内の生存確認とALB readinessを区別。DB障害だけで全container再起動が連鎖しない設計にする。',('S05',))
+add('ALB・ECS','E09','NGINXを採用するECS（条件付き）','proxy_connect_timeout / proxy_read_timeout / proxy_send_timeout','接続とI/O間隔／upstreamへの通信','各既定60秒。read/sendは処理総時間ではない。','connect3秒、read/send90秒（共有画面の例）','read90秒で少しずつ返す応答を総90秒に制限できるわけではない。必ずE01/E02/E03のdeadlineを別に実装。',('S53',))
+add('ALB・ECS','E10','NGINX等の受信server（条件付き）','client_header_timeout / client_body_timeout / send_timeout','ヘッダ受信・body受信・応答送信のI/O待ち','製品依存。NGINXは通常60秒。','ヘッダ10秒、body/send30秒を起点に確認','帳票JSONのサイズ・送信帯域に合わせる。I/O間隔の制限であり総deadlineの代替にはしない。',('S54',))
+add('ALB・ECS','E11','ECS Service Connectを追加している場合のみ','timeout.perRequestTimeoutSeconds / idleTimeoutSeconds','request総時間とidle／追加proxyの時計','HTTP系idle既定300秒、TCP既定3600秒。TCPでperRequest指定不可。','通常25秒、バック55秒、帳票80秒。idle120秒の例','指定経路にないため本案の必須設定ではない。採用済みなら隠れたproxyの上限を確認し、業務deadlineより外側に置く。',('S07',))
+
+add('Valkey','V01','ECS → Valkey client','connect timeout（client library）','接続／cache接続開始から','library依存','0.2秒（200ms）','小さなGETの低遅延設計例。DNS/TLSやフェイルオーバーで短すぎる場合は計測で調整するが、DBへ進む時間を残す。')
+add('Valkey','V02','ECS → Valkey client','command/read timeout（client library）','command待ち／GET等の発行から','library依存。serverのtimeoutとは別。','0.3秒（300ms）','GETが遅い時にアプリが待つ上限。接続とcommandを含めcache段階総0.5秒で打ち切る。')
+add('Valkey','V03','ECSのcache処理','total cache phase deadline / retry count','総時間／cache確認開始から','アプリ実装','0.5秒、通常の自動retryなし','cache missとcache障害を区別。閲覧cacheならDBへfallback。認証・lock・idempotency記録なら失敗時に迂回してよいとは限らない。')
+add('Valkey','V04','node-based ElastiCache parameter group','timeout','idle／最後のcommand等の活動から','0はidle切断なし。family別に確認。古い表では>=20秒。','600秒（対応するcustom parameter groupの場合）','これはGET実行上限ではない。default parameter groupは直接変更しない。Serverlessではこのserver側項目は設定不可。',('S08','S09'))
+add('Valkey','V05','Valkey接続プール（client）','idle eviction / connection validation','idle管理／最後の利用から','library依存','未使用240秒で破棄、借用時に健全性確認','server側600秒より先に破棄。pool下限が常時接続を保つ場合はidle evictionの適用条件を確認する。')
+add('Valkey','V06','Valkey node / client TCP socket','tcp-keepalive / SO_KEEPALIVE','通信生存確認／idle後のprobe','engine/familyとOS依存。serverlessのserver値は変更不可。','client側60秒からprobe。node側は対応可否を確認','TCP probeは業務commandの終了を保証しない。AWS表には古い0秒と変更後300秒が並ぶので、現行familyをdescribeして確認。',('S09','S38'))
+add('Valkey','V07','ECSのcacheデータ','TTL（EXPIRE / SET EXなど）','データ期限／保存または期限更新から','アプリがデータ鮮度に応じて決定','閲覧cache300秒±jitterの例','5分で古い値を捨てることと、0.3秒でGETを諦めることは別。業務lockやidempotencyの期限へ同じ値を流用しない。')
+
+add('RDS・Aurora','D01','ECSのDB connection pool','pool acquire timeout','借用待ち／connection要求から','library依存。HikariCP connectionTimeout既定30000ms。','通常1秒、HikariCP例は3000ms','既存connection待ちと新規作成が重なる実装がある。HikariCPの3000msは新規作成を含む取得上限として扱い、別の3秒を二重加算しない。',('S19',))
+add('RDS・Aurora','D02','ECS → RDS Proxy driver','connection timeout / login timeout','接続／新しいDB client接続の確立','driverと認証方式に依存','3秒以内','DNS・TCP・TLS・認証が対象に含まれるか確認。pgJDBC connectTimeout=3（秒）、Connector/J connectTimeout=3000（ms）の例。',('S17','S18'))
+add('RDS・Aurora','D03','RDS Proxy default target group','ConnectionBorrowTimeout','DB接続借用／ProxyがDB connectionを探す時','既定120秒、API範囲0～300秒','2秒','DB接続枯渇やfailover中の待ち。SQL実行の上限ではない。クライアントcommand8秒の内側にSQL5秒と一緒に収める。',('S10','S12'))
+add('RDS・Aurora','D04','RDS Proxy本体','IdleClientTimeout','idle／前request完了後に次requestが来ない間','既定1800秒。実環境のAPI/console制約を確認。','1800秒を維持','ECS→Proxyの未使用connectionが対象。長く実行中のSQLを1800秒で打ち切る設定ではなく、Proxy→DBのpoolidleとも別。',('S10','S11'))
+add('RDS・Aurora','D05','RDS Proxy → Aurora connection pool','MaxConnectionsPercent / MaxIdleConnectionsPercent','容量・接続再利用（timeoutではない）','Aurora系既定100%、idle比率は指定maxの半分','80% / 40%を起点に容量検証','例でありAWSの推奨値ではない。実利用に30%以上のheadroomを持てるか、max allowedメトリクス・pinning・task数で判定する。',('S10','S12'))
+add('RDS・Aurora','D06','ECSのDB connection pool','idleTimeout / maxLifetime','未使用時間と接続寿命／最後の使用・接続生成から','HikariCP等に依存。Proxy client寿命24時間は固定。','idle240秒、maxLifetime1800秒','240 < Proxy idle1800、1800 < 86400。途中のconntrack350秒も検討。HikariCPのidleTimeoutはminIdle条件と掃除の遅れがある。',('S10','S19','S38'))
+add('RDS・Aurora','D07','ECSのDB driver','socket/read timeout / network timeout','I/O待ち／driverがDBからの応答を待つ時','driverごとに単位とリセット条件が異なる','8秒（PG socketTimeout=8、MySQL socketTimeout=8000の例）','borrow2 + SQL5 + 取消余裕1を見込む。socketだけで総8秒を保証できない実装には別のcommand deadlineを付ける。',('S17','S18'))
+add('RDS・Aurora','D08','ECSのDB access層','DB phase deadline / transaction deadline','総時間／DB段階・transaction開始から','アプリ実装。ORMの実効性を確認。','DB段階12秒、transaction8秒','複数SQLが各5秒なら合計は増える。残り時間に応じて各SQL上限を縮める。rollback/commit待ちも8秒・12秒の外へ漏らさない。')
+add('RDS・Aurora','D09','Aurora PostgreSQLの業務接続','statement_timeout','SQL総時間／commandがDBに届いてから','既定0（無効）、単位省略時ms','5000ms（5秒）','SQL実行だけでなくstatement内のlock待ち等も含む。業務専用role・Proxy InitQuery等で適用。バッチ・保守roleへ一律適用しない。',('S15',))
+add('RDS・Aurora','D10','Aurora PostgreSQLの業務接続','lock_timeout','lock取得待ち／各lock取得試行から','既定0（無効）、単位省略時ms','1000ms（1秒）','statement5秒の内側の待ちであり、5秒に必ず1秒を足すわけではない。lock timeout後はtransactionをrollbackする。',('S15',))
+add('RDS・Aurora','D11','Aurora PostgreSQLの業務接続','idle_in_transaction_session_timeout','transaction内idle／次commandを待つ間','既定0（無効）、単位省略時ms','5000ms（5秒）','BEGIN後にアプリが黙ったままlockを持つ事故を抑える。実行中SQLの総時間制限ではない。切断したconnectionをpoolへ返さない。',('S15',))
+add('RDS・Aurora','D12','対応するAurora PostgreSQL版のみ','transaction_timeout','transaction総時間／transaction開始から','PG17の機能。採用Aurora版で存在確認が必要。既定0。','8000msの候補（未対応版はアプリD08）','SHOW/pg_settingsで存在を確認してから設定。上流PostgreSQLのlatestにある機能がすべてAuroraにもあるとは考えない。',('S15',))
+add('RDS・Aurora','D13','Aurora MySQLの読み取りSQL','max_execution_time / MAX_EXECUTION_TIME hint','対象SELECTの実行／SQL開始から','既定0（無効）、ms。主にread-only SELECT対象。','5000ms（対象SELECT）','UPDATE/INSERT/DELETEやすべてのstored procedureを一律5秒で停止できる設定ではない。更新はD15/D08で別に扱う。',('S16',))
+add('RDS・Aurora','D14','Aurora MySQLのInnoDB業務接続','innodb_lock_wait_timeout','InnoDB行lock待ち／待ち開始から','一般的既定50秒、秒単位。採用engine値を確認。','1秒','metadata lock用lock_wait_timeoutとは別。lock待ち終了時にstatementだけrollbackする動作もあるため、アプリ側でtransaction全体をrollback。',('S57',))
+add('RDS・Aurora','D15','Aurora MySQLを使うdriver/ORM','query timeout / explicit cancellation','SQL待機・取消／statement開始から','driver・ORM・RDS Proxy経由で実効性が異なる','query5秒 + command8秒 + transaction8秒','更新の停止が実際にDBへ届くか検証。socket切断をquery cancel成功と同一視しない。commit結果不明時は冪等keyで結果確認する。',('S18',))
+add('RDS・Aurora','D16','Aurora MySQL server','wait_timeout / interactive_timeout','未使用session／最後のSQL等の終了から','一般的既定28800秒、実パラメータ値を確認','業務Proxy経路では安易に短縮せず現行値維持','SQL実行上限ではない。Proxy管理のDB接続を短いwait_timeoutで頻繁に閉じると、再接続負荷を増やす。',('S16',))
+add('RDS・Aurora','D17','Aurora MySQL server','net_read_timeout / net_write_timeout','データ読取・書込のI/O待ち','一般的既定30秒 / 60秒、秒単位','現行30秒 / 60秒を起点に実測','DB client command8秒と対象SQL5秒が先に制限。server変数を短くすると大きいJSON/結果の送信にも影響する。',('S16',))
+add('RDS・Aurora','D18','RDS Proxy target group','InitQuery / session設定方式','初期化／新規DB connectionを作る時','未設定。全接続への統一設定を用意できる。','業務用Proxyでstatement/lockを統一する候補','PGでSETやset_configを毎回使うとpinningが増える可能性。動的deadlineを優先する場合もpinningメトリクスで容量影響を評価。',('S12','S13'))
+add('RDS・Aurora','D19','Aurora Serverless v2 cluster','ServerlessV2ScalingConfiguration.MinCapacity / MaxCapacity','容量（timeoutではない）','engine・Regionで許容範囲が異なる','本番例Min2 / Max16 ACU。負荷試験で決定','自動拡張があることはSQL5秒を保証しない。小さすぎるMin、低いMax、lock、非効率SQLは別々に調べる。',('H05','S14'))
+add('RDS・Aurora','D20','Aurora Serverless v2 cluster','SecondsUntilAutoPause / MinCapacity=0','idle停止／ユーザー接続のない期間','0 ACU対応版のみauto-pause。RDS Proxy関連clusterは自動停止しない。','今回のProxy併用本番例ではauto-pauseを前提にしない','Proxyの継続接続があるため、Min0にしただけで休眠・再開する設計にはならない。Proxyを外した開発環境では復帰時間を別予算にする。',('S14',))
+
+add('SQS・Lambda','Q01','画面ECS → SQS SDK','connect/read timeout / total SendMessage deadline','送信待ち／SDK呼出し開始から','SDK依存。max_attemptsは初回を含む。','接続1秒、read2秒、送信総4秒、最大2attempts','2回×（1+2）秒をそのまま使えば6秒以上になる。残り総4秒で各attemptを縮め、曖昧な成功にjobId/冪等化で対応。',('S52',))
+add('SQS・Lambda','Q02','画面ECSのjob受付endpoint','acceptance request deadline','総時間／画面からjob受付要求を受けた時','アプリ実装','5秒（client10秒）','SQS受理・jobId保存と受付応答を短くする。SQSへ送った後に画面へ返せなかった場合の重複受付も検証する。')
+add('SQS・Lambda','Q03','SQS queue','VisibilityTimeout','不可視／consumerがメッセージを受け取ってから','既定30秒、0～43200秒','420秒（6×Lambda70 + window0）','Lambda用AWS推奨式に合わせる。420秒はjobの完成予定時刻ではない。単なる70秒より大きくしthrottling等の再試行余裕を確保。',('S20','S21','S23'))
+add('SQS・Lambda','Q04','SQS queue / 自前consumer','ReceiveMessageWaitTimeSeconds / WaitTimeSeconds','受信待ち／ReceiveMessage開始から','既定0秒、0～20秒','自前consumerなら20秒（HTTP read25秒以上）','Lambda ESMのpollerはAWS管理なのでSDK read25秒を利用者が直接設定する項目ではない。queue属性とpoller実装を混同しない。',('S20','S22','S26'))
+add('SQS・Lambda','Q05','SQS queue','DelaySeconds','配信遅延／送信後、受信可能になるまで','既定0秒、0～900秒','0秒','visibilityは受信後、delayは受信前。画面を待たせるためにvisibilityを増やす使い方ではない。',('S20',))
+add('SQS・Lambda','Q06','SQS queue','MessageRetentionPeriod','保存期限／メッセージの保存期間','既定345600秒（4日）、60～1209600秒（14日）','345600秒（4日）','HTTPが切れてもメッセージは残る。保存期限は古い仕事を実行してよい期限とは別。業務のexpiresAtも持たせる。',('S20',))
+add('SQS・Lambda','Q07','SQS source queue → DLQ','RedrivePolicy.maxReceiveCount / DLQ retention','再配信回数と保存期限','DLQ未設定なら回数上限による退避なし。設定方式を確認。','maxReceiveCount5、DLQ保存14日','失敗jobを隔離して調査。standard queueのDLQ保存は元のenqueue時刻の影響があるのでsourceより長くする。5回×420秒は厳密な処理終了時刻でない。',('S20','S56'))
+add('SQS・Lambda','L01','標準Lambda function','Timeout','実行総時間／function invocation','既定3秒、1～900秒','70秒','handler内のHTTPや後処理を70秒より先に止める。2026年追加のManaged Instancesでは対象async/ESMに5400秒上限があるが本案は標準Lambda。',('S25','H13'))
+add('SQS・Lambda','L02','SQS → Lambda event source mapping','MaximumBatchingWindowInSeconds / BatchSize','batch蓄積／pollerがbatchを集める間','standard queue window0～300秒、FIFOはwindow対象外','window0秒、BatchSize1','1jobが重い本案は1件ずつ。後でwindow5秒にすると推奨visibilityも425秒へ。batch内を直列処理するなら全件合計をLambda上限内へ。',('S23',))
+add('SQS・Lambda','L03','SQS → Lambda event source mapping','FunctionResponseTypes=ReportBatchItemFailures','失敗報告／handler応答時','通常はbatch単位の成功/失敗','有効化','部分成功で済んだjobを再実行しない。タイムアウトして応答そのものがない場合は部分成功を返せないので、冪等化は依然必要。',('S24',))
+add('SQS・Lambda','L04','Lambda → 画面ALB → バックECS','HTTP total deadline / connect/read timeout','総時間／バックHTTP要求開始から','library依存','総55秒、接続3秒、readは残り時間以下','バックECS50秒より長く、Lambda70秒より短い。retryなしを起点とし、再配信によるretryはjobIdで制御。ALB idle90秒はこの総時間を延長しない。')
+add('SQS・Lambda','L05','Lambda handler','soft execution deadline / remaining time guard','総時間／handler入口と残り実行時間','アプリ実装。context remaining timeを参照。','soft60秒、終了処理10秒を予約','最大55秒のHTTPと前後処理5秒を60秒へ収める。残り時間が不足する時は新しい仕事を始めず失敗として返す。')
+add('SQS・Lambda','L06','ESMとLambda/ECS同時処理容量','ScalingConfig.MaximumConcurrency / reserved concurrency','同時実行数（timeoutではない）','通常ESMとprovisioned modeでは制御方法が異なる','10並列を例に、ECS/DBの収容力で決める','pollerが増えてもバック50秒を守れる数に抑える。reserved concurrencyをESM上限より小さくしてthrottlingを自作しない。',('S23',))
+add('SQS・Lambda','L07','job状態管理・画面polling','job deadline / expiresAt / poll interval','業務経過／受付から、poll間隔','アプリ契約。SQSの必須属性ではない。','初回完了SLO120秒、処理期限3600秒、poll2～5秒','SLO超過で「遅延中」を表示し、受付済jobを勝手に再送しない。3600秒超のjobは未実行なら期限切れとして記録。利用者取消も状態で伝える。')
+
+add('帳票','R01','画面ECS → 帳票ALB → EC2','HTTP total deadline / connect/read timeout','総時間／帳票server呼出し開始から','HTTP client実装','総65秒、接続3秒、readは残り時間以下','前処理2秒＋呼出し65秒＋後処理3秒=70秒を画面ECS75秒以内へ。read65秒と接続3秒を単純に足して68秒にしない。')
+add('帳票','R02','EC2帳票アプリ','request/render deadline','総時間／帳票要求を受けてから','OSではなく帳票アプリ／ジョブ実装の設定','60秒','生成ライブラリ、child process、template読み込み、JSON処理、応答を含める。HTTP切断後に子processだけ動き続けないよう取消する。')
+add('帳票','R03','EC2 HTTP server','keep-alive idle timeout','無通信／最後のHTTP利用から','Web server製品依存','100秒','帳票ALB idle70秒より長くする。帳票アプリの60秒deadlineを100秒へ置き換える意味ではない。',('S01',))
+add('帳票','R04','EC2 → ECS（JSONを別HTTPで取得する場合のみ）','HTTP total deadline / connect timeout','総時間／JSON取得呼出し開始から','利用者記述のJSONが応答か別要求かは未確定','取得総15秒、接続3秒','同じTCPの応答JSONなら追加設定不要。別要求なら専用data endpointへアクセスし、ECS側12秒。帳票60秒の中に15秒を含める。')
+add('帳票','R05','JSON取得用ECS endpoint（R04の場合のみ）','data request deadline','総時間／データ要求の受付から','アプリ実装','12秒','待機中の画面要求へ再入してthread poolを使い尽くさない。専用経路と容量を用意。15秒取得＋35秒生成＋前後5秒=55秒 < EC2 60秒。')
+
+add('API Gateway・ネットワーク','G01','Regional REST / Private RESTのmethod integration','timeoutInMillis','統合総時間／Gatewayがbackend統合を開始してから','BUFFERED既定上限29000ms、設定50～29000ms。延長承認で29秒超。','25000ms（25秒）','ECS20秒＋戻り等の余裕を確保。認証前後のGateway外側時間やtoken取得は含まれない。stageへ再deployし実効値を確認。',('S27','H08'))
+add('API Gateway・ネットワーク','G02','API Gateway frontend（REST）','Idle connection timeout','接続idle／frontend connectionの無通信','310秒、変更不可として公開','AWS管理310秒を把握','統合25秒やSTREAM idle300秒とは別。クライアントpool45秒を起点に閉じた接続の再利用を避ける。',('S27',))
+add('API Gateway・ネットワーク','G03','REST method integration','responseTransferMode','転送方式（timeoutの解釈を切り替える）','既定BUFFERED。STREAMはHTTP_PROXY/AWS_PROXY等の条件。','本案はBUFFEREDを明示','STREAMなら最大15分・Regional/Privateのidle5分という別設計。少量JSONの本案へheartbeatを足すだけではSTREAMにならない。',('S31','S32'))
+add('API Gateway・ネットワーク','G04','VPC Link v2','subnet/SG / connectionType / connectionId / integration-target','接続経路（独立したrequest timeout項目なし）','同一account、subnet/SG変更不可、Region/AZ制約','AVAILABLE確認、HTTPSでALBへ統合','RESTはLB ARNをintegration-targetに指定する。HTTP API用listener ARNの設定例と混同しない。遅さをLink用timeoutという架空の属性で直さない。',('S28','S29'))
+add('API Gateway・ネットワーク','G05','VPC Link v2運用','60-day inactivity lifecycle','経路休眠／60日間trafficなし','60日でINACTIVE、ENI再作成に数分の場合','状態監視と実疎通。休眠からの復帰を試験','1リクエストの25秒timeoutとは違う。ほぼ使わないAPIでは必要な運用疎通により経路も確認し、延長だけで解決しようとしない。',('S28',))
+add('API Gateway・ネットワーク','G06','API Gateway → ECSの信頼できるheader','integration.request.header.X-Gateway-Start-Ms = context.requestTimeEpoch','残り時間の共有／Gateway入口時刻から','REST parameter mappingのcontext変数を利用する設計例','入口から22秒を内部予算、ECS min(20秒, 残り−2秒)','ALBの新規target接続10秒が起きると、固定ECS20秒＋接続10秒はGateway25秒を超える。入口時刻でECSの上限を短縮し、headerの上書きと時計差を試験。',('S58','S59'))
+add('API Gateway・ネットワーク','N01','GWLBE / VPC endpoint service / execute-api endpoint','独立したHTTP処理timeout属性はなし','通信経路・接続状態','利用者が変更する共通HTTP deadlineは公開されていない','依存するGWLB/NLB/Gatewayとclientを設定','GWLBEはrouteの入口、serviceは提供定義、endpointはENI入口。すべてのendpointに「350秒固定」を一括で断定しない。',('S36','S37'))
+add('API Gateway・ネットワーク','N02','GWLB listener','tcp.idle_timeout.seconds','TCP flow idle／最後の有効packetから','既定350秒、60～6000秒。変更は5-tuple stickiness時。','350秒を維持','APIの処理20秒より十分長い。5-tuple以外では変更できない条件を確認。新しいflowへの適用と既存flowの残存も考慮。',('S33','S34','H10'))
+add('API Gateway・ネットワーク','N03','GWLB listener（条件付き）','send_tcp_reset.on_idle_timeout.enabled','idle切断の通知方式','既定false','必要時trueを検証して採用','idle失効後の無言dropをRSTへ変える機能。処理を完了させる機能ではない。client retryとPOST重複を検証してから選ぶ。',('S33',))
+add('API Gateway・ネットワーク','N04','Salesforce経路のNLB TCP listener','tcp.idle_timeout.seconds','TCP flow idle／最後のpacketから','既定350秒、60～6000秒','350秒を維持','listener属性で設定。TLS listener350秒固定とは違う。PrivateLink cross-Regionではcustom TCP idleが使えない条件もある。',('S35','S37','H09'))
+add('API Gateway・ネットワーク','N05','NLB TLS listenerを採用する場合のみ','TLS connection idle timeout','TLS接続idle／無通信から','350秒、変更不可','350秒（AWS管理）','TLS終端とTCP passthroughは別設計。TLS listenerのheartbeat動作も別。NLBでTLS終端する時はbackendのTLS/Host/SNIを改めて検証。',('S35',))
+add('API Gateway・ネットワーク','N06','GWLB/NLB UDP flow（参考）','UDP flow idle timeout','UDP flow状態／最後のpacketから','120秒、変更不可','120秒（AWS管理）','本案のHTTP/TLSは内側TCP。GWLB外側GENEVEのUDP6081と、業務TCPの350秒を取り違えない。',('S34','S35'))
+add('API Gateway・ネットワーク','N07','Palo Alto VM-Series / PAN-OS','Device > Setup > Session > Session Timeouts: TCP','TCP established idle／無通信から','PAN-OS11.1資料で既定3600秒。App-ID別timeoutが優先。','global3600秒を維持、該当App-IDの実効値>=350秒を確認','globalだけを見ない。ssl/web-browsing等の識別後timeout、decryption、session end reasonと両方向routeも確認。実PAN-OS版は未提供。',('S39',))
+add('API Gateway・ネットワーク','N08','Palo Alto TCP session','TCP init / TCP handshake','接続確立／SYN→SYN-ACK、SYN-ACK→ACK','PAN-OS11.1既定5秒 / 10秒、各1～60秒','既定を維持（client接続3秒が先に制限）','established idle3600秒とは別。小さくしすぎると遅延だけで接続不良、大きくしすぎると障害判定が遅れる。',('S39',))
+add('API Gateway・ネットワーク','N09','EC2帳票server / Palo Alto applianceのENI','ConnectionTrackingSpecification.TcpEstablishedTimeout','SG connection tracking idle／最後のtrafficから','Nitro v6原則350秒、他は432000秒。例外機種あり。範囲60～432000秒。','現行実効値を取得。GWLB/NLBを延長するならそれ以上','現行の350秒network例では無通信240秒pool破棄や60秒probeを検討。AWS管理ENIを利用者所有ENIと同じように変更できるとは考えない。',('S38',))
+add('API Gateway・ネットワーク','N10','長期TCP接続のclient/server OS','SO_KEEPALIVE / TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT','接続生存確認／無通信とprobe間隔','OS・library・権限に依存','必要なsocketのみ60秒 / 15秒 / 3回の設計例','最短L4 idle350秒より短いprobe。request総deadlineやSQL cancelを延ばさない。GWLBE経路ではprobeが両方向で通るかpacket観測する。',('S38','S34'))
+
+add('認証','T01','外部/Salesforce → Cognito token endpoint','HTTP total deadline / connect/read timeout','token取得総時間／取得開始から','client libraryまたはNamed Credential実装に依存','総10秒、接続3秒、readは残り以内','token cache missの時だけ。token取得が失敗したら認証失敗・依存サービス障害を区別し、業務APIを未認証で流さない。',('S40',))
+add('認証','T02','Cognito app client','AccessTokenValidity / TokenValidityUnits.AccessToken','token有効期限／発行からexpまで','既定1時間。単位設定と利用app clientの制約を確認。','AccessTokenValidity=3600、単位seconds','3600秒はtokenの利用可能期間、HTTP待機10秒ではない。M2M client credentialsではrefresh tokenを使わず再取得する。',('S43','S40'))
+add('認証','T03','token client cache','refresh-at / expiry margin / single-flight','再取得時期／token発行後と残り期限','AWSはおおむね有効期間75%で再取得する指針','2700秒より少し前（0～60秒jitter）、残り60秒以上を要求','多くのclientが同時にtoken endpointへ殺到しない。client_id・scope等ごとに分離し、失敗時の再取得にも総10秒を適用。',('S42',))
+add('認証','T04','Cognito custom domainのCloudFront','Cognito-managed distributionのorigin timeout','AWS管理／ドメイン提供経路','Cognitoが管理するdistribution。利用者が通常のorigin属性を編集する構成ではない。','変更対象にせずclient T01とtoken cacheで制御','CloudFrontの30秒や120秒をCognito管理distributionへ自由に設定できると書かない。顧客所有CloudFrontを別途置いた場合はT06以降。',('S41',))
+add('認証','T05','API Gateway REST Cognito authorizer','COGNITO_USER_POOLS / Authorization scopes','認証・認可／API入口でtoken検証','HTTP APIのJWT authorizerとは別方式','業務resource-server scopeをmethodに設定','token取得を毎回中継するHTTP proxyではない。access tokenをscopeで検証。Lambda authorizerを追加している場合はその実行時間も別途予算化。',('S44',))
+add('認証','T06','顧客所有CloudFront（存在する場合のみ）','ConnectionAttempts / ConnectionTimeout','origin接続／各接続attempt','attempts1～3、timeout1～10秒','attempts1、connect3秒の候補','Cognitoが作るdistributionには適用しない。本案で顧客所有CloudFrontの存在は未確認。追加する場合のみ設定表へ採用。',('S46','S47'))
+add('認証','T07','顧客所有CloudFront（条件付き）','OriginReadTimeout / ResponseCompletionTimeout','packet間待ちとresponse全体の総時間','readの公開範囲1～120秒、completion未設定なら総時間制約なし','token中継例read5秒、completion8秒、client10秒','completion >= readを守る。POSTのread失敗はGET/HEADとretry動作が異なる。token応答を共有cacheへ無条件保存しない。',('S46','S47'))
+add('認証','T08','顧客所有CloudFront（条件付き）','OriginKeepaliveTimeout','origin接続idle／応答後の未使用時間','公開範囲1～300秒、quota/設定を確認','60秒（origin server側はそれより長く）','業務request8秒とは別のconnection再利用。所有・制御できるoriginとの組合せでだけ整合を決める。',('S46','S47'))
+add('認証','T09','Cognito GetClientTokenを選ぶ場合のみ','ExplicitAuthFlows=ALLOW_CLIENT_TOKEN_AUTH / SDK timeout','M2M認証／専用API呼出し','2026-08-31追加。domain不要、client secretが必要。','別案として検討。総取得10秒を継承','OAuth /oauth2/token経路を黙って変更しない。SDK/API、PrivateLink対応を利用するにはSalesforce側の認証・接続の実装検証が必要。',('S45','H12'))
+
+add('横断','X01','client・ECS・Lambdaのretry層','max attempts / backoff / jitter / total retry budget','再試行総時間／初回から全attempt完了まで','SDK・HTTP clientごとに既定が異なる','同期APIは通常1attempt。SQS送信は総4秒内で最大2。','上位3回×下位3回=最大9回という増幅を避ける。GETでも余力確認、更新は同一idempotency keyなしに再送しない。',('S52',))
+add('横断','X02','全アプリ境界','deadline propagation / cancellation / correlation ID','残り予算／入口deadlineからの差分','アプリ実装。共通AWS属性はない。','child timeout=min(設定上限, 残り時間−終了余裕)','外部のdeadline headerは信用せず上限をclamp。時刻差にはmonotonic clockを使い、timeout後のDB取消・job結果を同じIDで追う。')
+add('横断','X03','job・更新APIの結果保存','idempotency key / deduplication retention','重複防止期限／受理・結果保存から','業務再送・DLQ再投入期間に応じて決定','再投入を含む保存期間以上。例21日以上を業務確認','cache TTL300秒やFIFOの短期dedup窓だけではDLQ再投入を守れない。決済等は永続的な業務unique制約も用いる。')
+
+SETTING_MAP = {row['id']: row for row in SETTINGS}

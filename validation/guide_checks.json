@@ -1,0 +1,32 @@
+{
+  "artifact": "AWS_Timeout_Design_Guide.xlsx",
+  "validation_date": "2026-10-08",
+  "tests_run": 12,
+  "failures": 0,
+  "errors": 0,
+  "result": "passed",
+  "sheets": 21,
+  "settings": 104,
+  "editable_inputs": 70,
+  "budget_conditions": 43,
+  "sources": 79,
+  "environment_tests_executed": false,
+  "tests": [
+    "test_all_populated_cells_use_meiryo_ui_and_monochrome",
+    "test_complete_initial_formula_caches",
+    "test_initial_budgets_and_independent_failure_scenarios",
+    "test_initial_cached_margins",
+    "test_internal_links_have_real_destinations",
+    "test_markdown_and_sources_are_complete",
+    "test_named_input_cells_and_validation",
+    "test_settings_examples_parse_and_tests_are_not_claimed_run",
+    "test_six_embedded_monochrome_diagrams",
+    "test_source_text_has_no_invalid_whitespace_or_encoding",
+    "test_tighter_deadline_never_expands_work",
+    "test_twenty_one_sheets_and_reading_order"
+  ],
+  "whitespace_check": "git diff --no-index --check: passed for eight added text files",
+  "python_syntax_check": "all tools parsed successfully",
+  "xlsx_archive_check": "passed: ZIP integrity and six embedded images",
+  "native_excel_report": "native_checks.json (COM startup failed; native render/recalculation unverified)"
+}
